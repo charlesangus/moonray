@@ -57,10 +57,10 @@ TextureSampler::TextureSampler()
 
 #if 1
     // Specifically disable auto-mipping and auto-tiling
-    mTextureSystem->attribute("automip", int(false));
+    mTextureSystem->attribute("automip", int(true));
     mTextureSystem->attribute("autotile", int(0));
-    mTextureSystem->attribute("accept_untiled", int(false));
-    mTextureSystem->attribute("accept_unmipped", int(false));
+    mTextureSystem->attribute("accept_untiled", int(true));
+    mTextureSystem->attribute("accept_unmipped", int(true));
 #else
     // Specifically enable auto-mipping and auto-tiling
     mTextureSystem->attribute("automip", int(true));
