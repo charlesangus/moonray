@@ -146,6 +146,15 @@ public:
         bool mHitGeom;
         bool mHitVolume;
         float mDeepIDs[7];  // Also see types.hh DEEP_DATA_MEMBERS
+
+        // Hard surface hit, measured from the camera, and this surface's own share of the camera
+        // sample: its radiance excluding what presence continuation saw behind it, and its
+        // presence-scaled path pixel weight.
+        float mT;
+        float mRayZ;
+        scene_rdl2::math::Vec3f mNormal;
+        scene_rdl2::math::Color mPresenceRadiance;
+        float mSurfaceWeight;
     };
 
     /// Constructor / Destructor
@@ -507,7 +516,8 @@ private:
             float &transparency, float &presenceTransparency, VolumeTransmittance& vt, unsigned sequenceID, float *aovs,
             uint32_t cryptomatteFlags, const Rdl2LightSetList& parentLobeLightSets,
             const scene_rdl2::rdl2::Material* newPriorityList[4], int newPriorityListCount[4],
-            int currentVolumeDepth, float rayEpsilon, float presence) const;
+            int currentVolumeDepth, float rayEpsilon, float presence,
+            const DeepParams *deepParams) const;
 
     // Auxiliary function to compute the in-camera radiance of a light hit directly by a primary ray. Not called
     // for non-primary rays since those contributions are already gathered by light & bsdf sampling.

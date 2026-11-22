@@ -206,14 +206,17 @@ void shadeBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
 
             rayStatesToFree[numRayStatesToFree++] = rs;
         } else {
-            // Populate deep data, first hit only for now
+            // Populate deep data for each camera-ray hit, including hits of presence continuation
+            // rays, which carry their own DeepData.
             if (ray->getDepth() == 0 && rs->mDeepDataHandle != pbr::nullHandle) {
                 pbr::DeepData *deepData = static_cast<pbr::DeepData*>(pbrTls->getListItem(rs->mDeepDataHandle, 0));
                 deepData->mHitDeep = 1;
                 deepData->mSubpixelX = rs->mSubpixel.mSubpixelX;
                 deepData->mSubpixelY = rs->mSubpixel.mSubpixelY;
                 deepData->mRayZ = ray->dir.z;
-                deepData->mDeepT = ray->tfar;
+                // A presence continuation ray starts at the previous hit, so its t is offset by the
+                // distance already travelled to give the deep Z of this surface.
+                deepData->mDeepT = rs->mPathVertex.pathDistance + ray->tfar;
                 deepData->mDeepNormal = ray->Ng;
 
                 // retrieve all of the deep IDs for this intersection from the primitive attrs
@@ -563,7 +566,16 @@ void shadeBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
                         presenceRay->mRay.geomID = -1;
                         presenceRay->mRay.primID = -1;
                         presenceRay->mRay.instID = -1;
+                        // The surface behind gets its own deep sample: radiance gathered by the
+                        // continuation ray lands at its hit, weighted by its share of the pixel.
                         presenceRay->mDeepDataHandle = nullHandle;
+                        if (rs->mDeepDataHandle != nullHandle && ray->getDepth() == 0) {
+                            presenceRay->mDeepDataHandle = pbrTls->allocList(sizeof(pbr::DeepData), 1);
+                            pbr::DeepData *presenceDeepData = static_cast<pbr::DeepData*>(
+                                pbrTls->getListItem(presenceRay->mDeepDataHandle, 0));
+                            presenceDeepData->mRefCount = 1;
+                            presenceDeepData->mHitDeep = 0;
+                        }
                         presenceRay->mParentLobeLightSets = rs->mParentLobeLightSets;
 
                         rs->mPathVertex.pathPixelWeight *= presences[i];
