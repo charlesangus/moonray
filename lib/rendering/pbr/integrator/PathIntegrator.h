@@ -147,6 +147,18 @@ public:
         bool mHitVolume;
         float mDeepIDs[7];  // Also see types.hh DEEP_DATA_MEMBERS
 
+        // Set for the hard surface pass, which renders the presence chain without volumes.
+        bool mIgnoreVolumes;
+        // A volume was hit by this ray segment, a segment in front of it in the presence chain,
+        // or a segment behind it once the presence continuation has returned.
+        bool mChainHitVolume;
+
+        // The AOVs of every surface behind this one in the presence chain, merged per channel:
+        // the summed contribution for accumulated AOVs, the front-most write for state variables
+        // and primitive attributes, and the min or max for MIN and MAX filtered LPE AOVs.
+        // Filled by this surface's presence continuation; null when AOVs are not recorded.
+        float *mPresenceAovs;
+
         // Hard surface hit, measured from the camera, and this surface's own share of the camera
         // sample: its radiance excluding what presence continuation saw behind it, and its
         // presence-scaled path pixel weight.
@@ -517,7 +529,7 @@ private:
             uint32_t cryptomatteFlags, const Rdl2LightSetList& parentLobeLightSets,
             const scene_rdl2::rdl2::Material* newPriorityList[4], int newPriorityListCount[4],
             int currentVolumeDepth, float rayEpsilon, float presence,
-            const DeepParams *deepParams) const;
+            DeepParams *deepParams) const;
 
     // Auxiliary function to compute the in-camera radiance of a light hit directly by a primary ray. Not called
     // for non-primary rays since those contributions are already gathered by light & bsdf sampling.

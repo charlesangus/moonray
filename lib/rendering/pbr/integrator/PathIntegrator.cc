@@ -50,6 +50,7 @@
 #include <scene_rdl2/scene/rdl2/Material.h>
 #include <scene_rdl2/scene/rdl2/VisibilityFlags.h>
 
+#include <cstring>
 #include <limits.h>
 
 namespace ispc {
@@ -346,6 +347,202 @@ shadeMaterial(mcrt_common::ThreadLocalState *tls, const scene_rdl2::rdl2::Materi
     }
 }
 
+namespace {
+
+// How a channel's writes along a presence chain combine into the flat AOV array. Accumulated
+// channels add up, state variables and primitive attributes keep the front-most write, and MIN
+// and MAX filtered LPE channels keep the smallest or largest value.
+enum class PresenceAovRule : uint8_t { ACCUMULATE, FRONT_MOST, MIN, MAX };
+
+PresenceAovRule
+presenceAovRule(const AovSchema::Entry &entry)
+{
+    const AovType type = entry.type();
+    if (type == AOV_TYPE_STATE_VAR || type == AOV_TYPE_PRIM_ATTR) {
+        return PresenceAovRule::FRONT_MOST;
+    }
+    if (type == AOV_TYPE_LIGHT_AOV || type == AOV_TYPE_VISIBILITY_AOV) {
+        if (entry.filter() == AOV_FILTER_MIN) return PresenceAovRule::MIN;
+        if (entry.filter() == AOV_FILTER_MAX) return PresenceAovRule::MAX;
+    }
+    return PresenceAovRule::ACCUMULATE;
+}
+
+// A quiet NaN with a payload no AOV writer produces, marking a channel no surface has written.
+constexpr uint32_t sUnwrittenAovBits = 0x7fc0d3e5u;
+
+inline float
+unwrittenAov()
+{
+    float value;
+    std::memcpy(&value, &sUnwrittenAovBits, sizeof(value));
+    return value;
+}
+
+inline bool
+isUnwrittenAov(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits == sUnwrittenAovBits;
+}
+
+// The same comparisons the LPE accumulation uses, so merged results match accumulating in place.
+inline float minAov(float earlier, float later) { return (earlier < later) ? earlier : later; }
+inline float maxAov(float earlier, float later) { return (earlier < later) ? later : earlier; }
+
+inline float
+aovDelta(float value, float start)
+{
+    if (start == 0.f) return value;
+    return (value == start) ? 0.f : value - start;
+}
+
+// Sets up the array a surface shades into. Accumulated channels continue from the running values
+// in startAovs so the flat sums keep their order of additions; the other channels start empty so
+// they hold only this surface's writes.
+void
+initPresenceLayerAovs(const AovSchema &aovSchema, const float *startAovs, float *layerAovs)
+{
+    for (const auto &entry : aovSchema) {
+        const PresenceAovRule rule = presenceAovRule(entry);
+        for (unsigned c = 0; c < entry.numChannels(); ++c) {
+            switch (rule) {
+            case PresenceAovRule::ACCUMULATE: *layerAovs = *startAovs;                    break;
+            case PresenceAovRule::FRONT_MOST: *layerAovs = unwrittenAov();                break;
+            case PresenceAovRule::MIN:        *layerAovs = scene_rdl2::math::pos_inf;     break;
+            case PresenceAovRule::MAX:        *layerAovs = scene_rdl2::math::neg_inf;     break;
+            }
+            ++layerAovs;
+            ++startAovs;
+        }
+    }
+}
+
+// Sets up DeepParams::mPresenceAovs before any surface behind has merged into it.
+void
+initPresenceBehindAovs(const AovSchema &aovSchema, float *behindAovs)
+{
+    for (const auto &entry : aovSchema) {
+        const PresenceAovRule rule = presenceAovRule(entry);
+        for (unsigned c = 0; c < entry.numChannels(); ++c) {
+            switch (rule) {
+            case PresenceAovRule::ACCUMULATE: *behindAovs = 0.f;                          break;
+            case PresenceAovRule::FRONT_MOST: *behindAovs = unwrittenAov();               break;
+            case PresenceAovRule::MIN:        *behindAovs = scene_rdl2::math::pos_inf;    break;
+            case PresenceAovRule::MAX:        *behindAovs = scene_rdl2::math::neg_inf;    break;
+            }
+            ++behindAovs;
+        }
+    }
+}
+
+// The AOVs a surface's deep sample carries: what it added to the running sums less what the
+// surfaces behind it added, its own state and attribute writes (or the schema's initial value
+// if it wrote none), and its own MIN and MAX values.
+void
+ownPresenceAovs(const AovSchema &aovSchema, const float *startAovs, const float *layerAovs,
+                const float *behindAovs, float *ownAovs)
+{
+    for (const auto &entry : aovSchema) {
+        const PresenceAovRule rule = presenceAovRule(entry);
+        const float initValue = entry.filter() == AOV_FILTER_CLOSEST ? 0.f : entry.defaultValue();
+        for (unsigned c = 0; c < entry.numChannels(); ++c) {
+            switch (rule) {
+            case PresenceAovRule::ACCUMULATE:
+                *ownAovs = aovDelta(*layerAovs, *startAovs) - *behindAovs;
+                break;
+            case PresenceAovRule::FRONT_MOST:
+                *ownAovs = isUnwrittenAov(*layerAovs) ? initValue : *layerAovs;
+                break;
+            case PresenceAovRule::MIN:
+            case PresenceAovRule::MAX:
+                *ownAovs = *layerAovs;
+                break;
+            }
+            ++ownAovs;
+            ++layerAovs;
+            ++startAovs;
+            ++behindAovs;
+        }
+    }
+}
+
+// Folds a surface reached through presence into the surface in front of it. Accumulated channels
+// hand their running values back to the caller's array; every channel's merge over the surface and
+// those behind it goes to the caller's DeepParams::mPresenceAovs.
+void
+mergePresenceLayerAovs(const AovSchema &aovSchema, const float *layerAovs,
+                       const float *layerBehindAovs, float *callerAovs, float *callerBehindAovs)
+{
+    for (const auto &entry : aovSchema) {
+        const PresenceAovRule rule = presenceAovRule(entry);
+        for (unsigned c = 0; c < entry.numChannels(); ++c) {
+            switch (rule) {
+            case PresenceAovRule::ACCUMULATE:
+                *callerBehindAovs = aovDelta(*layerAovs, *callerAovs);
+                *callerAovs = *layerAovs;
+                break;
+            case PresenceAovRule::FRONT_MOST:
+                *callerBehindAovs = isUnwrittenAov(*layerAovs) ? *layerBehindAovs : *layerAovs;
+                break;
+            case PresenceAovRule::MIN:
+                *callerBehindAovs = minAov(*layerBehindAovs, *layerAovs);
+                break;
+            case PresenceAovRule::MAX:
+                *callerBehindAovs = maxAov(*layerBehindAovs, *layerAovs);
+                break;
+            }
+            ++layerAovs;
+            ++layerBehindAovs;
+            ++callerAovs;
+            ++callerBehindAovs;
+        }
+    }
+}
+
+// Saves the camera sample's initial AOVs and sets the array up to hold the front surface's own
+// writes.
+void
+beginPresenceAovs(const AovSchema &aovSchema, float *aovs, float *startAovs, float *behindAovs)
+{
+    std::memcpy(startAovs, aovs, aovSchema.numChannels() * sizeof(float));
+    initPresenceLayerAovs(aovSchema, startAovs, aovs);
+    initPresenceBehindAovs(aovSchema, behindAovs);
+}
+
+// Turns the front surface's own writes back into the flat result: the front-most write over the
+// surfaces behind and the initial value, and the min or max over all of them.
+void
+resolvePresenceFlatAovs(const AovSchema &aovSchema, const float *startAovs, const float *behindAovs,
+                        float *aovs)
+{
+    for (const auto &entry : aovSchema) {
+        const PresenceAovRule rule = presenceAovRule(entry);
+        for (unsigned c = 0; c < entry.numChannels(); ++c) {
+            switch (rule) {
+            case PresenceAovRule::ACCUMULATE:
+                break;
+            case PresenceAovRule::FRONT_MOST:
+                if (isUnwrittenAov(*aovs)) {
+                    *aovs = isUnwrittenAov(*behindAovs) ? *startAovs : *behindAovs;
+                }
+                break;
+            case PresenceAovRule::MIN:
+                *aovs = minAov(minAov(*startAovs, *behindAovs), *aovs);
+                break;
+            case PresenceAovRule::MAX:
+                *aovs = maxAov(maxAov(*startAovs, *behindAovs), *aovs);
+                break;
+            }
+            ++aovs;
+            ++startAovs;
+            ++behindAovs;
+        }
+    }
+}
+
+} // namespace
 
 // BsdfLobe is passed in so that we can track the lobe type which generated
 // the ray for ray debugging purposes. Other than that, it's not needed.
@@ -417,11 +614,17 @@ PathIntegrator::computeRadianceRecurse0(pbr::TLState *pbrTls, mcrt_common::RayDi
 
     // We only ignore volumes in the case where there's a deep buffer but we hit a volume, in which case we're now
     // calling cRR0() again to obtain the hard surface results without the volume, to add them to the deep buffer
-    bool ignoreVolumes = (deepParams && deepParams->mHitVolume);
+    bool ignoreVolumes = (deepParams && deepParams->mIgnoreVolumes);
     if (!ignoreVolumes) {
+        if (deepParams) {
+            deepParams->mDeepBuffer->setVolumeRayOrigin(pbrTls, pv.pathDistance);
+        }
         hitVolume = computeRadianceVolume(pbrTls, ray, sp, pv, lobeType,
             radiance, sequenceID, vt, aovs, deepParams, nullptr, &volumeSurfaceT);
-        if (deepParams) deepParams->mHitVolume = hitVolume;
+        if (deepParams) {
+            deepParams->mHitVolume = hitVolume;
+            deepParams->mChainHitVolume = deepParams->mChainHitVolume || hitVolume;
+        }
         pv.pathThroughput *= vt.transmittance();
     }
 
@@ -1367,13 +1570,30 @@ PathIntegrator::computeRadiance(pbr::TLState *pbrTls, int pixelX, int pixelY,
         deepParams.mPixelSamples = pixelSamples;
         deepParams.mHitGeom = false;
         deepParams.mHitVolume = false;
+        deepParams.mIgnoreVolumes = false;
+        deepParams.mChainHitVolume = false;
         deepParams.mVolumeAovs = deepVolumeAovs;
         deepParams.mSurfaceWeight = 0.f;
+        deepParams.mPresenceAovs = nullptr;
 
         // Only the primary ray and its presence continuations populate the deep buffer.
+        // The front surface shades into the AOV array with only its own writes, the surfaces
+        // behind it through presence merge into mPresenceAovs, and the two resolve back into
+        // the flat AOVs afterwards.
+        scene_rdl2::alloc::Arena *deepArena = pbrTls->mArena;
+        SCOPED_MEM(deepArena);
+        const unsigned numAovChannels = aovSchema.numChannels();
+        float *startAovs = nullptr;
+        float *ownAovs = nullptr;
+        if (aovs) {
+            startAovs = deepArena->allocArray<float>(numAovChannels);
+            ownAovs = deepArena->allocArray<float>(numAovChannels);
+            deepParams.mPresenceAovs = deepArena->allocArray<float>(numAovChannels);
+            beginPresenceAovs(aovSchema, aovs, startAovs, deepParams.mPresenceAovs);
+        }
 
         // First render normally, capturing the deep volume segments (if any) and
-        // the flat radiance + aovs.  Check if we hit any volumes with the primary ray.
+        // the flat radiance + aovs.  Check if we hit any volumes along the presence chain.
         float deepTransparency;
         scene_rdl2::math::Color deepRadiance = computeRadianceRecurse0(pbrTls, ray, sp, pv, /* lobe = */ nullptr,
                                                                        deepTransparency, vt,
@@ -1387,8 +1607,13 @@ PathIntegrator::computeRadiance(pbr::TLState *pbrTls, int pixelX, int pixelY,
         alpha = deepAlpha;
         pathPixelWeight = pv.pathPixelWeight;
 
-        if (deepParams.mHitVolume) {
-            // We hit a volume.  Render again with the volume disabled to get the
+        if (aovs) {
+            ownPresenceAovs(aovSchema, startAovs, aovs, deepParams.mPresenceAovs, ownAovs);
+            resolvePresenceFlatAovs(aovSchema, startAovs, deepParams.mPresenceAovs, aovs);
+        }
+
+        if (deepParams.mChainHitVolume) {
+            // We hit a volume.  Render again with volumes disabled to get the
             // correct hard surface radiance without volume attenuation applied.
             // Note that we can't alter the radiance or aovs computed above.  We need
             // independent hs* data structures for this.
@@ -1410,23 +1635,39 @@ PathIntegrator::computeRadiance(pbr::TLState *pbrTls, int pixelX, int pixelY,
                 hsPv.lpeStateId = lightAovs.cameraEventTransition(pbrTls);
             }
 
-            float hsTransparency;
+            deepParams.mHitGeom = false;
+            deepParams.mIgnoreVolumes = true;
+            deepParams.mChainHitVolume = false;
+            deepParams.mSurfaceWeight = 0.f;
+
             float *hsAovs = aovParams.mDeepAovs;
+            const bool splitHsAovs = hsAovs && deepParams.mPresenceAovs;
+            if (splitHsAovs) {
+                beginPresenceAovs(aovSchema, hsAovs, startAovs, deepParams.mPresenceAovs);
+            } else {
+                deepParams.mPresenceAovs = nullptr;
+            }
+
+            float hsTransparency;
             scene_rdl2::math::Color hsRadiance = computeRadianceRecurse0(pbrTls, hsRay, hsSp, hsPv, /* lobe = */ nullptr,
                                                                          hsTransparency, vt,
                                                                          hsSequenceID, hsAovs, depth,
                                                                          &deepParams, cryptomatteFlags,
                                                                          Rdl2LightSetList());
 
-            float hsAlpha = 1.f;
-
-            if (deepParams.mHitGeom) {
+            if (deepParams.mHitGeom && deepParams.mSurfaceWeight > 0.f) {
+                if (splitHsAovs) {
+                    ownPresenceAovs(aovSchema, startAovs, hsAovs, deepParams.mPresenceAovs, ownAovs);
+                }
                 // put the hard surface deep intersection into the deep buffer
                 scene_rdl2::math::Vec3f hsNormal = hsRay.getNg();
                 deepBuffer->addSample(pbrTls, deepParams.mPixelX, deepParams.mPixelY,
                                       deepParams.mSampleX, deepParams.mSampleY, 0,
                                       deepParams.mDeepIDs, hsRay.tfar, hsRay.dir.z, hsNormal,
-                                      hsAlpha, hsRadiance, hsAovs, 1.f, 1.f);
+                                      deepParams.mSurfaceWeight,
+                                      hsRadiance - deepParams.mPresenceRadiance,
+                                      splitHsAovs ? ownAovs : hsAovs,
+                                      1.f, deepParams.mSurfaceWeight);
             }
 
         } else {
@@ -1439,7 +1680,8 @@ PathIntegrator::computeRadiance(pbr::TLState *pbrTls, int pixelX, int pixelY,
                                       deepParams.mSampleX, deepParams.mSampleY, 0,
                                       deepParams.mDeepIDs, deepParams.mT, deepParams.mRayZ,
                                       deepParams.mNormal, deepParams.mSurfaceWeight,
-                                      deepRadiance - deepParams.mPresenceRadiance, aovs,
+                                      deepRadiance - deepParams.mPresenceRadiance,
+                                      aovs ? ownAovs : aovs,
                                       1.f, deepParams.mSurfaceWeight);
             }
         }
@@ -1506,7 +1748,7 @@ PathIntegrator::computeRadiancePresence(pbr::TLState *pbrTls, mcrt_common::RayDi
         uint32_t cryptomatteFlags, const Rdl2LightSetList& parentLobeLightSets,
         const scene_rdl2::rdl2::Material* newPriorityList[4], int newPriorityListCount[4],
         int currentVolumeDepth, float rayEpsilon, float presence,
-        const DeepParams *deepParams) const
+        DeepParams *deepParams) const
 {
     float totalPresence = (1.0f - prevPv.totalPresence) * presence;
 
@@ -1568,31 +1810,65 @@ PathIntegrator::computeRadiancePresence(pbr::TLState *pbrTls, mcrt_common::RayDi
     VolumeTransmittance vtPresence;
     scene_rdl2::math::Color presenceRadiance;
     if (ray.getDepth() == 0) {
-        // A primary ray that hit a volume is re-rendered without volumes for its hard surface
-        // sample, so only volume-free presence chains record their surfaces here.
-        const bool recordDeep = deepParams && !deepParams->mHitVolume;
+        // Each surface reached through presence shades into its own AOV array, so its deep sample
+        // carries only its own AOVs; the arrays merge back into the caller's for the flat result.
+        // A chain that hits a volume records its surfaces in the hard surface pass instead, which
+        // renders the chain again without volumes.
+        const bool recordDeep = deepParams != nullptr;
+        const bool splitAovs = recordDeep && aovs && deepParams->mPresenceAovs;
+        const AovSchema &aovSchema = *pbrTls->mFs->mAovSchema;
+        scene_rdl2::alloc::Arena *arena = pbrTls->mArena;
+        SCOPED_MEM(arena);
+
         DeepParams presenceDeepParams;
+        float *layerAovs = aovs;
+        float *layerBehindAovs = nullptr;
         if (recordDeep) {
             presenceDeepParams = *deepParams;
             presenceDeepParams.mHitGeom = false;
             presenceDeepParams.mHitVolume = false;
             presenceDeepParams.mSurfaceWeight = 0.f;
+            presenceDeepParams.mPresenceAovs = nullptr;
+            if (splitAovs) {
+                layerAovs = arena->allocArray<float>(aovSchema.numChannels());
+                layerBehindAovs = arena->allocArray<float>(aovSchema.numChannels());
+                initPresenceLayerAovs(aovSchema, aovs, layerAovs);
+                initPresenceBehindAovs(aovSchema, layerBehindAovs);
+                presenceDeepParams.mPresenceAovs = layerBehindAovs;
+            }
         }
         presenceRadiance = computeRadianceRecurse0(pbrTls, presenceRay, sp, newPv, lobe, presenceTransparency,
-                                vtPresence, sequenceID, aovs, /* depth = */ nullptr,
+                                vtPresence, sequenceID, layerAovs, /* depth = */ nullptr,
                                 recordDeep ? &presenceDeepParams : nullptr,
                                 cryptomatteFlags, parentLobeLightSets);
-        if (recordDeep && presenceDeepParams.mHitGeom && !presenceDeepParams.mHitVolume &&
+        if (recordDeep && presenceDeepParams.mHitGeom && !presenceDeepParams.mChainHitVolume &&
             presenceDeepParams.mSurfaceWeight > 0.f) {
             const scene_rdl2::math::Color own = presenceRadiance - presenceDeepParams.mPresenceRadiance;
-            constexpr int channels[3] = { 0, 1, 2 };
-            const float values[3] = { own.r, own.g, own.b };
-            presenceDeepParams.mDeepBuffer->addSample(pbrTls, presenceDeepParams.mPixelX,
-                                presenceDeepParams.mPixelY, presenceDeepParams.mSampleX,
-                                presenceDeepParams.mSampleY, 0, presenceDeepParams.mDeepIDs,
-                                presenceDeepParams.mT, presenceDeepParams.mRayZ, presenceDeepParams.mNormal,
-                                presenceDeepParams.mSurfaceWeight, channels, 3, values,
-                                1.f, presenceDeepParams.mSurfaceWeight);
+            if (splitAovs) {
+                float *ownAovs = arena->allocArray<float>(aovSchema.numChannels());
+                ownPresenceAovs(aovSchema, aovs, layerAovs, layerBehindAovs, ownAovs);
+                presenceDeepParams.mDeepBuffer->addSample(pbrTls, presenceDeepParams.mPixelX,
+                                    presenceDeepParams.mPixelY, presenceDeepParams.mSampleX,
+                                    presenceDeepParams.mSampleY, 0, presenceDeepParams.mDeepIDs,
+                                    presenceDeepParams.mT, presenceDeepParams.mRayZ,
+                                    presenceDeepParams.mNormal, presenceDeepParams.mSurfaceWeight,
+                                    own, ownAovs, 1.f, presenceDeepParams.mSurfaceWeight);
+            } else {
+                constexpr int channels[3] = { 0, 1, 2 };
+                const float values[3] = { own.r, own.g, own.b };
+                presenceDeepParams.mDeepBuffer->addSample(pbrTls, presenceDeepParams.mPixelX,
+                                    presenceDeepParams.mPixelY, presenceDeepParams.mSampleX,
+                                    presenceDeepParams.mSampleY, 0, presenceDeepParams.mDeepIDs,
+                                    presenceDeepParams.mT, presenceDeepParams.mRayZ,
+                                    presenceDeepParams.mNormal, presenceDeepParams.mSurfaceWeight,
+                                    channels, 3, values, 1.f, presenceDeepParams.mSurfaceWeight);
+            }
+        }
+        if (recordDeep) {
+            deepParams->mChainHitVolume = deepParams->mChainHitVolume || presenceDeepParams.mChainHitVolume;
+        }
+        if (splitAovs) {
+            mergePresenceLayerAovs(aovSchema, layerAovs, layerBehindAovs, aovs, deepParams->mPresenceAovs);
         }
     } else {
         presenceRadiance = computeRadianceRecurse1(pbrTls, presenceRay, sp, newPv, lobe, presenceTransparency,

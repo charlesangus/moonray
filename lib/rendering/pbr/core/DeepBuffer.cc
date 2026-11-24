@@ -109,6 +109,22 @@ DeepBuffer::initDeep(unsigned width, unsigned height,
         mChannelsPerAOV.push_back(numFloats);
     }
 
+    mChannelMerge.assign(mNumChannels, ChannelMerge::SUM);
+    mHasMinMaxChannels = false;
+    unsigned aovChannel = 3;
+    for (size_t i = 0; i < aovSchema.size(); i++) {
+        const pbr::AovSchema::Entry &entry = aovSchema[i];
+        ChannelMerge merge = ChannelMerge::SUM;
+        if (entry.type() != pbr::AOV_TYPE_BEAUTY && entry.type() != pbr::AOV_TYPE_ALPHA) {
+            if (entry.filter() == pbr::AOV_FILTER_MIN) merge = ChannelMerge::MIN;
+            if (entry.filter() == pbr::AOV_FILTER_MAX) merge = ChannelMerge::MAX;
+        }
+        for (unsigned c = 0; c < entry.numChannels(); c++) {
+            mChannelMerge[aovChannel++] = merge;
+        }
+        if (merge != ChannelMerge::SUM) mHasMinMaxChannels = true;
+    }
+
     // curvatureTolerance is the max angle in degrees, mCurvatureTolerance is the
     // dot product of two vectors differing by that angle: cos(curvatureTolerance)
     mCurvatureTolerance = cos(curvatureTolerance * M_PI / 180.f);
@@ -286,7 +302,7 @@ DeepBuffer::addSample8x8(unsigned x, unsigned y, unsigned subpixelX, unsigned su
             current->mMask |= (1ull << sidx);
             current->mAlpha += alpha * scale;
             for (int i = 0; i < numChannels; i++) {
-                getChannel(current, channels[i]) += values[i] * scale;
+                mergeChannel(current, channels[i], values[i], scale);
             }
             current->mTotalWeight += weight;
             return;
@@ -332,9 +348,18 @@ DeepBuffer::addSample8x8(unsigned x, unsigned y, unsigned subpixelX, unsigned su
         // clear all channel data
         getChannel(newSegment, i) = 0;
     }
+    if (mHasMinMaxChannels) {
+        for (int i = 0; i < mNumChannels; i++) {
+            if (mChannelMerge[i] == ChannelMerge::MIN) {
+                getChannel(newSegment, i) = scene_rdl2::math::pos_inf;
+            } else if (mChannelMerge[i] == ChannelMerge::MAX) {
+                getChannel(newSegment, i) = scene_rdl2::math::neg_inf;
+            }
+        }
+    }
     for (int i = 0; i < numChannels; i++) {
         // set channel data for specified channels (note numChannels vs. mNumChannels!)
-        getChannel(newSegment, channels[i]) += values[i] * scale;
+        mergeChannel(newSegment, channels[i], values[i], scale);
     }
     newSegment->mTotalWeight = weight;
     newSegment->mNext = nullptr;
@@ -373,6 +398,12 @@ DeepBuffer::finishPixel(unsigned threadIdx)
 }
 
 void
+DeepBuffer::setVolumeRayOrigin(pbr::TLState *pbrTls, float tOrigin)
+{
+    mVolumePixelBuffers[pbrTls->mThreadIdx].mTOrigin = tOrigin;
+}
+
+void
 DeepBuffer::addVolumeSegments(pbr::TLState *pbrTls,
                               unsigned x, unsigned y, float sx, float sy,
                               float rayZ,
@@ -401,12 +432,13 @@ DeepBuffer::addVolumeSegments(pbr::TLState *pbrTls,
     // copy in the segment data
     VolumeInputSegmentList& isl = vpb.mInputSegmentLists[sample];
     isl.mNumSegments = numVps;
+    isl.mTOrigin = vpb.mTOrigin;
     for (int i = 0; i < numVps; i++) {
         const pbr::VolumeProperties& props = vp[i];
         VolumeInputSegment *segment = (VolumeInputSegment*)pbrTls->mPixelArena->alloc(sizeof(VolumeInputSegment));
         segment->mNext = nullptr;
-        segment->mTFront = props.mTStart;
-        segment->mTBack = props.mTStart + props.mDelta;
+        segment->mTFront = vpb.mTOrigin + props.mTStart;
+        segment->mTBack = vpb.mTOrigin + (props.mTStart + props.mDelta);
         segment->mSigmaT = props.mSigmaT;
         if (isl.mFirst == nullptr) {
             isl.mFirst = segment;
@@ -432,7 +464,7 @@ DeepBuffer::addVolumeSample(pbr::TLState *pbrTls,
     VolumeSample *sample = (VolumeSample*)pbrTls->mPixelArena->alloc(getVolumeSampleSize());
     sample->mNext = vpb.mSampleList;  // put at the start of the list
     vpb.mSampleList = sample;
-    sample->mT = t;
+    sample->mT = vpb.mTOrigin + t;
     sample->mTransmittance = transmittance;
     sample->mChannels[0] = rgb[0];
     sample->mChannels[1] = rgb[1];
@@ -601,6 +633,7 @@ void DeepBuffer::VolumePixelBuffer::clear()
     mCurrentY = 0xffffffff;
     mNumPixelSamples = 0;
     mAccumRayZ = 0.f;
+    mTOrigin = 0.f;
 
     // Clear all the VolumeInputSegments.  These are stored in an arena and
     // are automatically freed when the current pixel is finished rendering.
@@ -608,6 +641,7 @@ void DeepBuffer::VolumePixelBuffer::clear()
         mInputSegmentLists[ps].mFirst = nullptr;
         mInputSegmentLists[ps].mLast = nullptr;
         mInputSegmentLists[ps].mNumSegments = 0;
+        mInputSegmentLists[ps].mTOrigin = 0.f;
     }
 
     // Don't need to free the VolumeSamples because they live in an arena
@@ -855,7 +889,8 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
                     bool isBlocked = deepBuffer.isBlockedByHardSurface(
                             hardSegments,
                             mMaskBits[ps],
-                            outputSegment->mTFront);
+                            outputSegment->mTFront,
+                            mInputSegmentLists[ps].mTOrigin);
 
                     // If it's blocked, we need to ignore it completely or it will
                     // incorrectly weight the merged sigmaT value.  This is because
@@ -1233,7 +1268,8 @@ DeepBuffer::writeHardSurfaceSegments(int idx,
             for (unsigned a = 0; a < channelsToOutput.size(); a++) {
                 for (unsigned chan = channelsToOutput[a].first; chan <= channelsToOutput[a].second; chan++) {
                     // copy in the channel data, normalizing it by dividing by mTotalWeight
-                    dp[channelIdxs[i]] = getChannel(hs, chan) / hs->mTotalWeight;
+                    dp[channelIdxs[i]] = isMinMaxChannel(chan) ? minMaxChannel(hs, chan) :
+                                         getChannel(hs, chan) / hs->mTotalWeight;
                     i++;
                 }
             }
@@ -1368,7 +1404,8 @@ DeepBuffer::writeHardSurfaceSegmentsNoMask(int idx,
                     // Copy in the channel data, normalizing it by dividing by mTotalWeight
                     // (which is actually the number of samples, so we're just taking the average
                     // value) and premultiply the alpha.
-                    dp[channelIdxs[i]] = getChannel(hs, chan) / hs->mTotalWeight * alpha;
+                    dp[channelIdxs[i]] = isMinMaxChannel(chan) ? minMaxChannel(hs, chan) :
+                                         getChannel(hs, chan) / hs->mTotalWeight * alpha;
                     i++;
                 }
             }

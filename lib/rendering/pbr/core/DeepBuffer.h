@@ -5,6 +5,9 @@
 
 #include <moonray/rendering/pbr/core/Aov.h>
 
+#include <cmath>
+#include <cstdint>
+
 #include <scene_rdl2/common/fb_util/PixelBuffer.h>
 #include <scene_rdl2/common/math/Color.h>
 #include <scene_rdl2/common/math/Vec3.h>
@@ -102,6 +105,11 @@ public:
                          const scene_rdl2::math::Color& transmittance,
                          const scene_rdl2::math::Color& rgb, const float *aovs);
 
+    // Distance along the camera ray to the origin of the ray segment whose volume
+    // segments and samples are added next.  Presence continuation segments start at the
+    // surface they passed through; primary rays start at 0.
+    void setVolumeRayOrigin(pbr::TLState *pbrTls, float tOrigin);
+
     void finishPixel(unsigned threadIdx);
 
     // Write the deep buffer to a deep file using OpenDCX
@@ -189,17 +197,46 @@ private:
         segment->mIDsAndChannels[mDeepIDChannels.size() + i] = value;
     }
 
+    inline void mergeChannel(HardSurfaceSegment *segment, unsigned i, float value, float scale) {
+        float &dest = getChannel(segment, i);
+        switch (mChannelMerge[i]) {
+        case ChannelMerge::SUM:
+            dest += value * scale;
+            break;
+        case ChannelMerge::MIN:
+            if (std::isfinite(value) && value < dest) dest = value;
+            break;
+        case ChannelMerge::MAX:
+            if (std::isfinite(value) && value > dest) dest = value;
+            break;
+        }
+    }
+
+    // A MIN or MAX channel holds the merged value itself, or an infinity when no finite
+    // value reached it, which is written as 0.
+    inline bool isMinMaxChannel(unsigned i) const {
+        return mChannelMerge[i] != ChannelMerge::SUM;
+    }
+    inline float minMaxChannel(const HardSurfaceSegment *segment, unsigned i) const {
+        const float value = getChannel(segment, i);
+        return std::isfinite(value) ? value : 0.f;
+    }
+
     // Traverse a HardSurfaceSegment linked list and check if the specified
     // subpixel (mask bit) is blocked by the hard surface at the distance value
     // t.
+    // Hard surfaces starting at or in front of tOrigin were passed through by the ray
+    // segment that sampled the volume, so they do not block it.
     bool isBlockedByHardSurface(const HardSurfaceSegment *firstSegment,
                                 uint64_t maskBit,
-                                float t) const
+                                float t,
+                                float tOrigin) const
     {
         uint64_t mask = 0;
         const HardSurfaceSegment *current = firstSegment;
         while (current) {
-            if (current->mTBack < t) {
+            if (current->mTBack < t &&
+                (tOrigin <= 0.f || current->mTFront > tOrigin * (1.f + sVolumeOriginTolerance))) {
                 mask |= current->mMask;
                 if (mask & maskBit) {
                     return true;
@@ -280,6 +317,7 @@ private:
         VolumeInputSegment *mFirst;
         VolumeInputSegment *mLast;
         unsigned mNumSegments;
+        float mTOrigin;
     };
 
     // One sample of the channel data (radiance + aovs) at a location mT along
@@ -367,6 +405,10 @@ private:
         // ray.z value varies significantly between the pixel samples.
         float mAccumRayZ;
 
+        // Offset added to the t values of the ray segment being integrated, see
+        // setVolumeRayOrigin().
+        float mTOrigin;
+
         // One linked list of VolumeInputSegments per pixel sample.
         // We keep track of the first and last segments in the list, and the
         // number of segments.
@@ -440,6 +482,14 @@ private:
 
     // the number of channels per AOV, typically 1-3
     std::vector<unsigned int> mChannelsPerAOV;
+
+    // Per beauty + aov channel: MIN or MAX filtered AOV channels merge samples by min or max
+    // of their finite values instead of a weighted sum.
+    enum class ChannelMerge : uint8_t { SUM, MIN, MAX };
+    std::vector<ChannelMerge> mChannelMerge;
+    bool mHasMinMaxChannels = false;
+
+    static constexpr float sVolumeOriginTolerance = 1e-5f;
 
     // total number of beauty + aov channels
     unsigned mNumChannels;
