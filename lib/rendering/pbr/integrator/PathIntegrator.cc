@@ -1575,6 +1575,7 @@ PathIntegrator::computeRadiance(pbr::TLState *pbrTls, int pixelX, int pixelY,
         deepParams.mVolumeAovs = deepVolumeAovs;
         deepParams.mSurfaceWeight = 0.f;
         deepParams.mPresenceAovs = nullptr;
+        deepBuffer->beginVolumeSample(pbrTls);
 
         // Only the primary ray and its presence continuations populate the deep buffer.
         // The front surface shades into the AOV array with only its own writes, the surfaces

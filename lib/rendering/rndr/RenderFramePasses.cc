@@ -814,7 +814,9 @@ RenderDriver::renderTileUniformSamples(RenderDriver *driver,
         }
 
         if (deepBuffer) {
-            deepBuffer->finishPixel(pbrTls->mThreadIdx);
+            const unsigned endSampleIdx = std::min(currEndSampleIdx, totalNumSamples);
+            const unsigned passSamples = endSampleIdx > currStartSampleIdx ? endSampleIdx - currStartSampleIdx : 0;
+            deepBuffer->finishPixel(pbrTls->mThreadIdx, px, py, passSamples);
         }
 
         // Update progress.

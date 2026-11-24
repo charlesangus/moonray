@@ -110,7 +110,13 @@ public:
     // surface they passed through; primary rays start at 0.
     void setVolumeRayOrigin(pbr::TLState *pbrTls, float tOrigin);
 
-    void finishPixel(unsigned threadIdx);
+    // Starts a camera sample: the volume segments it adds next, across all its presence
+    // continuation segments, form one pixel sample.
+    void beginVolumeSample(pbr::TLState *pbrTls);
+
+    // Folds the volume samples of the pass just rendered for pixel (x, y), which cast
+    // numSamples camera samples, into the pixel's stored volume output segments.
+    void finishPixel(unsigned threadIdx, unsigned x, unsigned y, unsigned numSamples);
 
     // Write the deep buffer to a deep file using OpenDCX
     void write(const std::string& filename,
@@ -304,11 +310,13 @@ private:
     // No channel data is associated with these.  mSigmaT is extinction coefficient
     // of the volume for the segment, which is used to calculate transmittance with
     // Beer's law.
+    // mTOrigin is the origin of the ray segment that sampled it, see setVolumeRayOrigin().
     struct VolumeInputSegment
     {
         VolumeInputSegment *mNext;
         float mTFront;
         float mTBack;
+        float mTOrigin;
         scene_rdl2::math::Color mSigmaT;
     };
 
@@ -317,7 +325,6 @@ private:
         VolumeInputSegment *mFirst;
         VolumeInputSegment *mLast;
         unsigned mNumSegments;
-        float mTOrigin;
     };
 
     // One sample of the channel data (radiance + aovs) at a location mT along
@@ -371,6 +378,11 @@ private:
     // VolumeOutputSegments per pixel.
     mutable std::vector<VolumeOutputSegment *> mVolumeOutputSegments;
 
+    // Per pixel, the number of camera samples folded into its VolumeOutputSegments.
+    std::vector<unsigned> mVolumeSampleCounts;
+
+    static void freeVolumeOutputSegments(VolumeOutputSegment *segment);
+
     // Similarly to VolumeSample, the size depends on the number of channels
     // and is only known at run time.
     size_t getVolumeOutputSegmentSize() const {
@@ -378,15 +390,12 @@ private:
     }
 
     // One of these per thread.  Keeps track of the data pertaining to the current
-    // pixel being rendered.  Note that this only works with batch render mode and NOT
-    // progressive render mode because batch render mode fully renders a pixel before
-    // moving on to the next one but progressive render mode only partially renders
-    // the pixel and makes multiple passes.
-    // Supporting progressive render mode would require a VolumePixelBuffer for
-    // EACH pixel in the image which would require a prohibitive amount of memory.
-    // With batch render mode we only need one of these per thread as each thread
-    // works on one pixel at a time.  The buffer can then be cleared and re-used
-    // for the next pixel.
+    // pixel being rendered in the current pass.  Each thread works on one pixel at a
+    // time, so the buffer is merged into the pixel's VolumeOutputSegments when the
+    // pixel's pass is finished, then cleared and re-used for the next pixel.  When a
+    // pixel is rendered over several passes (progressive or adaptive sampling), each
+    // pass is averaged into the stored VolumeOutputSegments by sample count, so no
+    // per-pixel input data is kept between passes.
     struct VolumePixelBuffer
     {
         // x, y coords of the current pixel being worked on by the thread.
@@ -409,6 +418,12 @@ private:
         // setVolumeRayOrigin().
         float mTOrigin;
 
+        // The pixel sample the current camera sample adds its volume segments to:
+        // sNoSample until it adds its first, sDroppedSample past mMaxPixelSamples.
+        static constexpr int sNoSample = -1;
+        static constexpr int sDroppedSample = -2;
+        int mOpenSample;
+
         // One linked list of VolumeInputSegments per pixel sample.
         // We keep track of the first and last segments in the list, and the
         // number of segments.
@@ -429,10 +444,15 @@ private:
         // list of VolumeOutputSegments.  Merging/compression is applied based on the
         // volCompressionRes.  The hard surfaces need to be considered to handle
         // partial occlusion of VolumeOutputSegments by hard surfaces properly.
+        // samplesPerPixel is the number of camera samples of this pass.  The stored
+        // segments, from storedSamples earlier camera samples, are averaged in by
+        // sample count; the caller frees them.
         VolumeOutputSegment* mergeSegments(const DeepBuffer& deepBuffer,
                                            unsigned samplesPerPixel,
                                            unsigned volCompressionRes,
-                                           const HardSurfaceSegment *hardSegments);
+                                           const HardSurfaceSegment *hardSegments,
+                                           const VolumeOutputSegment *storedSegments,
+                                           unsigned storedSamples);
     };
     std::vector<VolumePixelBuffer> mVolumePixelBuffers;  // one per thread
 

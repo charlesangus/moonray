@@ -65,13 +65,9 @@ DeepBuffer::clear()
 
     // iterate over the volume output segment linked lists and free the segments
     for (size_t i = 0; i < mWidth * mHeight; i++) {
-        VolumeOutputSegment *current = mVolumeOutputSegments[i];
-        while (current) {
-            VolumeOutputSegment *next = current->mNext;
-            free(current);
-            current = next;
-        }
+        freeVolumeOutputSegments(mVolumeOutputSegments[i]);
         mVolumeOutputSegments[i] = nullptr;
+        mVolumeSampleCounts[i] = 0;
     }
 
     for (unsigned i = 0; i < mNumRenderThreads; i++) {
@@ -143,10 +139,12 @@ DeepBuffer::initDeep(unsigned width, unsigned height,
     }
 
     mVolumeOutputSegments.resize(mWidth * mHeight, nullptr);
+    mVolumeSampleCounts.resize(mWidth * mHeight, 0);
 
     mVolumePixelBuffers.resize(mNumRenderThreads);
     for (unsigned i = 0; i < mNumRenderThreads; i++) {
         mVolumePixelBuffers[i].mSampleList = nullptr;
+        mVolumePixelBuffers[i].mNumPixelSamples = VolumePixelBuffer::mMaxPixelSamples;
         mVolumePixelBuffers[i].clear();
     }
 }
@@ -383,24 +381,52 @@ DeepBuffer::addSample8x8Safe(unsigned x, unsigned y, unsigned subpixelX, unsigne
 }
 
 void
-DeepBuffer::finishPixel(unsigned threadIdx)
+DeepBuffer::freeVolumeOutputSegments(VolumeOutputSegment *segment)
+{
+    while (segment) {
+        VolumeOutputSegment *next = segment->mNext;
+        free(segment);
+        segment = next;
+    }
+}
+
+void
+DeepBuffer::finishPixel(unsigned threadIdx, unsigned x, unsigned y, unsigned numSamples)
 {
     VolumePixelBuffer &vpb = mVolumePixelBuffers[threadIdx];
+    const unsigned idx = mWidth * y + x;
+    const unsigned passSamples = std::max(std::min(numSamples, VolumePixelBuffer::mMaxPixelSamples),
+                                          vpb.mNumPixelSamples);
 
-    if (vpb.mCurrentX != 0xffffffff && vpb.mCurrentY != 0xffffffff) {
-        mVolumeOutputSegments[mWidth * vpb.mCurrentY + vpb.mCurrentX] =
-            vpb.mergeSegments(*this,
-                              std::min(mSamplesPerPixel, VolumePixelBuffer::mMaxPixelSamples),
-                              mVolCompressionRes,
-                              mHardSurfaceSegments[0][mWidth * vpb.mCurrentY + vpb.mCurrentX]);
-        vpb.clear();
+    tbb::mutex::scoped_lock lock(mPixelMutex[getMutexIdx(x, y)]);
+
+    VolumeOutputSegment *storedSegments = mVolumeOutputSegments[idx];
+    const unsigned storedSamples = mVolumeSampleCounts[idx];
+    if (vpb.mNumPixelSamples > 0 || storedSegments) {
+        mVolumeOutputSegments[idx] = vpb.mergeSegments(*this,
+                                                       passSamples,
+                                                       mVolCompressionRes,
+                                                       mHardSurfaceSegments[0][idx],
+                                                       storedSegments,
+                                                       storedSamples);
+        freeVolumeOutputSegments(storedSegments);
     }
+    mVolumeSampleCounts[idx] = storedSamples + passSamples;
+    vpb.clear();
 }
 
 void
 DeepBuffer::setVolumeRayOrigin(pbr::TLState *pbrTls, float tOrigin)
 {
     mVolumePixelBuffers[pbrTls->mThreadIdx].mTOrigin = tOrigin;
+}
+
+void
+DeepBuffer::beginVolumeSample(pbr::TLState *pbrTls)
+{
+    VolumePixelBuffer &vpb = mVolumePixelBuffers[pbrTls->mThreadIdx];
+    vpb.mOpenSample = VolumePixelBuffer::sNoSample;
+    vpb.mTOrigin = 0.f;
 }
 
 void
@@ -414,31 +440,38 @@ DeepBuffer::addVolumeSegments(pbr::TLState *pbrTls,
     vpb.mCurrentX = x;
     vpb.mCurrentY = y;
 
-    unsigned subpixelX = (uint8_t)(sx * 8.f);
-    unsigned subpixelY = (uint8_t)(sy * 8.f);
-    int subpixelIdx = subpixelY * 8 + subpixelX;
-    uint64_t maskBit = 1ull << subpixelIdx;
-
-    if (vpb.mNumPixelSamples == VolumePixelBuffer::mMaxPixelSamples) {
-        // just throw away the extras as they add little anyway assuming mMaxVolumePixelSamples
-        //  is high
+    if (vpb.mOpenSample == VolumePixelBuffer::sDroppedSample) {
         return;
     }
 
-    vpb.mAccumRayZ += rayZ;  // taking the avg of this when converting T to Z
-    unsigned sample = vpb.mNumPixelSamples++;
-    vpb.mMaskBits[sample] = maskBit;
+    if (vpb.mOpenSample == VolumePixelBuffer::sNoSample) {
+        if (vpb.mNumPixelSamples == VolumePixelBuffer::mMaxPixelSamples) {
+            // just throw away the extras as they add little anyway assuming mMaxVolumePixelSamples
+            //  is high
+            vpb.mOpenSample = VolumePixelBuffer::sDroppedSample;
+            return;
+        }
+
+        unsigned subpixelX = (uint8_t)(sx * 8.f);
+        unsigned subpixelY = (uint8_t)(sy * 8.f);
+        int subpixelIdx = subpixelY * 8 + subpixelX;
+        uint64_t maskBit = 1ull << subpixelIdx;
+
+        vpb.mAccumRayZ += rayZ;  // taking the avg of this when converting T to Z
+        vpb.mOpenSample = vpb.mNumPixelSamples++;
+        vpb.mMaskBits[vpb.mOpenSample] = maskBit;
+    }
 
     // copy in the segment data
-    VolumeInputSegmentList& isl = vpb.mInputSegmentLists[sample];
-    isl.mNumSegments = numVps;
-    isl.mTOrigin = vpb.mTOrigin;
+    VolumeInputSegmentList& isl = vpb.mInputSegmentLists[vpb.mOpenSample];
+    isl.mNumSegments += numVps;
     for (int i = 0; i < numVps; i++) {
         const pbr::VolumeProperties& props = vp[i];
         VolumeInputSegment *segment = (VolumeInputSegment*)pbrTls->mPixelArena->alloc(sizeof(VolumeInputSegment));
         segment->mNext = nullptr;
         segment->mTFront = vpb.mTOrigin + props.mTStart;
         segment->mTBack = vpb.mTOrigin + (props.mTStart + props.mDelta);
+        segment->mTOrigin = vpb.mTOrigin;
         segment->mSigmaT = props.mSigmaT;
         if (isl.mFirst == nullptr) {
             isl.mFirst = segment;
@@ -631,18 +664,18 @@ void DeepBuffer::VolumePixelBuffer::clear()
 {
     mCurrentX = 0xffffffff;
     mCurrentY = 0xffffffff;
-    mNumPixelSamples = 0;
     mAccumRayZ = 0.f;
     mTOrigin = 0.f;
+    mOpenSample = sNoSample;
 
     // Clear all the VolumeInputSegments.  These are stored in an arena and
     // are automatically freed when the current pixel is finished rendering.
-    for (int ps = 0; ps < mMaxPixelSamples; ps++) {
+    for (unsigned ps = 0; ps < mNumPixelSamples; ps++) {
         mInputSegmentLists[ps].mFirst = nullptr;
         mInputSegmentLists[ps].mLast = nullptr;
         mInputSegmentLists[ps].mNumSegments = 0;
-        mInputSegmentLists[ps].mTOrigin = 0.f;
     }
+    mNumPixelSamples = 0;
 
     // Don't need to free the VolumeSamples because they live in an arena
     // and are automatically freed when the current pixel is finished rendering.
@@ -653,8 +686,18 @@ DeepBuffer::VolumeOutputSegment*
 DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
                                              unsigned samplesPerPixel,
                                              unsigned volCompressionRes,
-                                             const HardSurfaceSegment *hardSegments)
+                                             const HardSurfaceSegment *hardSegments,
+                                             const VolumeOutputSegment *storedSegments,
+                                             unsigned storedSamples)
 {
+    // Earlier passes of this pixel are in storedSegments, from storedSamples camera
+    // samples.  This pass is merged on a bin grid that also spans the stored segments.
+    // At each bin boundary the stored and new transmittances are averaged, weighted by
+    // their unblocked sample counts, and the bin's sigmaT is derived from the combined
+    // transmittance.  Radiance is combined the same way, so the averaged list composites
+    // to the sample-weighted mean of all passes.
+    const bool combine = storedSegments || storedSamples > 0;
+
     // We need to figure out how many segments the merged output segment list has.
     // Use the average segment length across all the segments in the set of
     // input segment lists and the min/max t extents of all those segments.
@@ -670,12 +713,55 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
         minT = std::min(minT, sampleMinT);
         maxT = std::max(maxT, sampleMaxT);
     }
-    if (totalNumSegments == 0) {
+    if (totalNumSegments == 0 && !storedSegments) {
         return nullptr;
     }
-    float avgLength = totalSegmentLength / totalNumSegments;
-    unsigned newNumSegments = (unsigned)ceil((maxT - minT) / avgLength);
-    float deltaT = ((maxT - minT) / newNumSegments);
+
+    // The stored segments in front to back order, with the stored transmittance at the
+    // front of each.
+    struct StoredSegment
+    {
+        const VolumeOutputSegment *mSegment;
+        scene_rdl2::math::Color mTransmittanceFront;
+    };
+    std::vector<StoredSegment> stored;
+    {
+        scene_rdl2::math::Color transmittance(1.f);
+        for (const VolumeOutputSegment *seg = storedSegments; seg; seg = seg->mNext) {
+            stored.push_back({seg, transmittance});
+            transmittance *= exp(-seg->mSigmaT * (seg->mTBack - seg->mTFront));
+        }
+    }
+
+    // Bin boundaries: evenly spaced over this pass's segments and the stored ones, or the
+    // stored boundaries when this pass has no volume segments.
+    std::vector<float> binT;
+    float deltaT = 0.f;
+    if (totalNumSegments > 0) {
+        float avgLength = totalSegmentLength / totalNumSegments;
+        if (!stored.empty()) {
+            minT = std::min(minT, stored.front().mSegment->mTFront);
+            maxT = std::max(maxT, stored.back().mSegment->mTBack);
+        }
+        unsigned numBins = (unsigned)ceil((maxT - minT) / avgLength);
+        deltaT = ((maxT - minT) / numBins);
+        binT.resize(numBins + 1);
+        for (unsigned s = 0; s <= numBins; s++) {
+            binT[s] = minT + deltaT * s;
+        }
+    } else {
+        binT.push_back(stored.front().mSegment->mTFront);
+        for (const StoredSegment &ss : stored) {
+            binT.push_back(ss.mSegment->mTBack);
+        }
+    }
+    const unsigned newNumSegments = binT.size() - 1;
+
+    float tToZ = mNumPixelSamples > 0 ? -(mAccumRayZ / mNumPixelSamples) : stored.front().mSegment->mTtoZ;
+    if (mNumPixelSamples > 0 && !stored.empty()) {
+        tToZ = (stored.front().mSegment->mTtoZ * storedSamples + tToZ * mNumPixelSamples) /
+               (storedSamples + mNumPixelSamples);
+    }
 
     // Create the merged output segment list.
     VolumeOutputSegment* firstOutputSegment = nullptr;
@@ -691,9 +777,9 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
         }
         outputSegment->mNext = nullptr;
         // T values for output segments are just evenly spaced
-        outputSegment->mTFront = minT + deltaT * s;
-        outputSegment->mTBack = minT + deltaT * (s + 1);
-        outputSegment->mTtoZ = -(mAccumRayZ / mNumPixelSamples);
+        outputSegment->mTFront = binT[s];
+        outputSegment->mTBack = binT[s + 1];
+        outputSegment->mTtoZ = tToZ;
         // The output sigmaT is merged below.
         outputSegment->mSigmaT = scene_rdl2::math::Color(0, 0, 0);
         // Radiance and AOVs are merged below.
@@ -863,12 +949,21 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
     //
     // This can also be extended to handle an arbitrary number of samples by simply adding
     // more exp() terms inside the log() and dividing by numPixelSamples instead of by 2.
+    //
+    // When averaging into stored segments, the stored transmittance at each bin boundary
+    // joins the sum weighted by the stored unblocked sample count, and the stored radiance
+    // is spread over the bins it overlaps, weighted the same way and not yet divided by
+    // the transmittance at the bin front.
     {
-        scene_rdl2::math::Color srcSigmaTSums[samplesPerPixel];  // per sample
-        for (unsigned i = 0; i < samplesPerPixel; i++) {
-            srcSigmaTSums[i] = scene_rdl2::math::Color(0.f);
+        std::vector<scene_rdl2::math::Color> srcSigmaTSums(mNumPixelSamples, scene_rdl2::math::Color(0.f));
+        // The input segment of each pixel sample whose origin applies at the current bin.
+        std::vector<const VolumeInputSegment *> originSegments(mNumPixelSamples);
+        for (unsigned ps = 0; ps < mNumPixelSamples; ps++) {
+            originSegments[ps] = mInputSegmentLists[ps].mFirst;
         }
         scene_rdl2::math::Color destSigmaSum(0.f);
+        scene_rdl2::math::Color destOpticalDepth(0.f);
+        size_t storedIdx = 0;
         unsigned destIdx = 0;
         VolumeOutputSegment *outputSegment = firstOutputSegment;
         while (outputSegment) {
@@ -884,13 +979,18 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
                 //  less than samplesPerPixel.  The remaining samples missed the volume.
                 if (ps < mNumPixelSamples) {
                     // Intersected the volume.
-                    // Check if this pixel sample is blocked by a hard surface.
+                    // Check if this pixel sample is blocked by a hard surface, past the
+                    // origin of the ray segment that sampled the volume at this depth.
                     // Each pixel sample has its single 8x8 coverage mask bit set in mMaskBits.
+                    const VolumeInputSegment *&originSegment = originSegments[ps];
+                    while (originSegment->mNext && originSegment->mNext->mTFront <= outputSegment->mTFront) {
+                        originSegment = originSegment->mNext;
+                    }
                     bool isBlocked = deepBuffer.isBlockedByHardSurface(
                             hardSegments,
                             mMaskBits[ps],
                             outputSegment->mTFront,
-                            mInputSegmentLists[ps].mTOrigin);
+                            originSegment->mTOrigin);
 
                     // If it's blocked, we need to ignore it completely or it will
                     // incorrectly weight the merged sigmaT value.  This is because
@@ -932,11 +1032,68 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
             // destSigmaSum = -log(expSum / numUnblockedSamples) / deltaT
             //
             // This avoids error accumulation.  The code can be rewritten as:
-            scene_rdl2::math::Color logTerm = -log(expSum / numUnblockedSamples) / deltaT;
-            scene_rdl2::math::Color sigmaT = logTerm - destSigmaSum;
-            outputSegment->mSigmaT = sigmaT;
-            outputSegment->mNumUnblockedSamples = numUnblockedSamples;
-            destSigmaSum = logTerm;
+            if (!combine) {
+                scene_rdl2::math::Color logTerm = -log(expSum / numUnblockedSamples) / deltaT;
+                scene_rdl2::math::Color sigmaT = logTerm - destSigmaSum;
+                outputSegment->mSigmaT = sigmaT;
+                outputSegment->mNumUnblockedSamples = numUnblockedSamples;
+                destSigmaSum = logTerm;
+            } else {
+                const float binFront = outputSegment->mTFront;
+                const float binBack = outputSegment->mTBack;
+
+                // The stored segment holding the bin's middle gives its unblocked count;
+                // in front of the stored segments every stored sample is unblocked.
+                const float binMid = 0.5f * (binFront + binBack);
+                while (storedIdx + 1 < stored.size() && stored[storedIdx].mSegment->mTBack <= binFront) {
+                    storedIdx++;
+                }
+                size_t midIdx = storedIdx;
+                while (midIdx + 1 < stored.size() && stored[midIdx + 1].mSegment->mTFront <= binMid) {
+                    midIdx++;
+                }
+                unsigned storedUnblocked = storedSamples;
+                scene_rdl2::math::Color storedTransmittance(1.f);
+                if (!stored.empty() && binMid >= stored.front().mSegment->mTFront) {
+                    storedUnblocked = stored[midIdx].mSegment->mNumUnblockedSamples;
+                }
+
+                // Stored transmittance at the bin back.
+                size_t backIdx = midIdx;
+                while (backIdx + 1 < stored.size() && stored[backIdx + 1].mSegment->mTFront <= binBack) {
+                    backIdx++;
+                }
+                if (!stored.empty() && binBack > stored.front().mSegment->mTFront) {
+                    const VolumeOutputSegment *seg = stored[backIdx].mSegment;
+                    const float depth = std::min(binBack, seg->mTBack) - seg->mTFront;
+                    storedTransmittance = stored[backIdx].mTransmittanceFront * exp(-seg->mSigmaT * depth);
+                }
+
+                const unsigned totalUnblocked = storedUnblocked + numUnblockedSamples;
+                outputSegment->mNumUnblockedSamples = totalUnblocked;
+                if (totalUnblocked > 0) {
+                    scene_rdl2::math::Color transmittance =
+                        (storedTransmittance * float(storedUnblocked) + expSum) / float(totalUnblocked);
+                    scene_rdl2::math::Color opticalDepth = -log(transmittance);
+                    outputSegment->mSigmaT = (opticalDepth - destOpticalDepth) / (binBack - binFront);
+                    destOpticalDepth = opticalDepth;
+                }
+
+                // Stored radiance, as composited, spread over the bins by overlap.
+                for (size_t k = storedIdx; k < stored.size() && stored[k].mSegment->mTFront < binBack; k++) {
+                    const VolumeOutputSegment *seg = stored[k].mSegment;
+                    const float length = seg->mTBack - seg->mTFront;
+                    const float overlap = std::min(seg->mTBack, binBack) - std::max(seg->mTFront, binFront);
+                    if (length <= 0.f || overlap <= 0.f) {
+                        continue;
+                    }
+                    const float weight = luminance(stored[k].mTransmittanceFront) *
+                                         seg->mNumUnblockedSamples * (overlap / length);
+                    for (int chan = 0; chan < deepBuffer.mNumChannels; chan++) {
+                        outputSegment->mChannels[chan] += seg->mChannels[chan] * weight;
+                    }
+                }
+            }
 
             outputSegment = outputSegment->mNext;
             destIdx++;
@@ -968,14 +1125,24 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
     // Delete any segments at the front of the volume with zero sigmaTs.  We don't
     // want to be merging in segments with non-zero sigmaTs into these because
     // these segments will no longer be empty space and will cause compositing artifacts.
+    // Stored radiance in those segments moves to the first segment kept.
+    std::vector<float> leadingChannels(combine ? deepBuffer.mNumChannels : 0, 0.f);
     while (outputSegment) {
         if (luminance(outputSegment->mSigmaT) > 0.f) {
             break;
+        }
+        for (size_t chan = 0; chan < leadingChannels.size(); chan++) {
+            leadingChannels[chan] += outputSegment->mChannels[chan];
         }
         VolumeOutputSegment *nextSegment = outputSegment->mNext;
         free(outputSegment);
         outputSegment = nextSegment;
         firstOutputSegment = outputSegment;
+    }
+    if (outputSegment) {
+        for (size_t chan = 0; chan < leadingChannels.size(); chan++) {
+            outputSegment->mChannels[chan] += leadingChannels[chan];
+        }
     }
 
     unsigned currCount = 0;     // The number of segments in this run of merged segments
@@ -1002,8 +1169,25 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
                 //  into the current output segment.  We sum in the sigmaT and adjust
                 //  the tBack value, adjust the linked list next pointer, and delete
                 //  the merged (next) segment.
-                outputSegment->mSigmaT += nextSegment->mSigmaT;
+                if (combine) {
+                    // Bins may differ in length here, so the run keeps a length-weighted
+                    // mean sigmaT.
+                    const float length = outputSegment->mTBack - outputSegment->mTFront;
+                    const float nextLength = nextSegment->mTBack - nextSegment->mTFront;
+                    outputSegment->mSigmaT = (outputSegment->mSigmaT * length + nextSegment->mSigmaT * nextLength) /
+                                             (length + nextLength);
+                    for (int chan = 0; chan < deepBuffer.mNumChannels; chan++) {
+                        outputSegment->mChannels[chan] += nextSegment->mChannels[chan];
+                    }
+                } else {
+                    outputSegment->mSigmaT += nextSegment->mSigmaT;
+                }
                 outputSegment->mTBack = nextSegment->mTBack;
+                if (combine) {
+                    for (int chan = 0; chan < deepBuffer.mNumChannels; chan++) {
+                        outputSegment->mChannels[chan] += nextSegment->mChannels[chan];
+                    }
+                }
                 outputSegment->mNext = nextSegment->mNext;
                 free(nextSegment);
                 currCount++;
@@ -1014,13 +1198,17 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
                 // The next segment is outside the maxDelta tolerance, so finish
                 //  up the current run of segments.  We just average the sigmaTs by dividing
                 //  the sum by the count of segments in this run of merged segments.
-                outputSegment->mSigmaT /= currCount;
+                if (!combine) {
+                    outputSegment->mSigmaT /= currCount;
+                }
                 currCount = 0;
             }
         } else if (currCount > 1) {
             // No next segment (we're at the end of the list), but we might
             //  need to finish up the current segment
-            outputSegment->mSigmaT /= currCount;
+            if (!combine) {
+                outputSegment->mSigmaT /= currCount;
+            }
         }
 
         outputSegment = outputSegment->mNext;
@@ -1050,9 +1238,19 @@ DeepBuffer::VolumePixelBuffer::mergeSegments(const DeepBuffer& deepBuffer,
     // at once.
 
     // Keep track of the total transmittance as we traverse the output samples
+    //
+    // Stored radiance already in an output segment is divided by the transmittance at
+    // its front here.
     scene_rdl2::math::Color totalTransmittance(1.f);
     outputSegment = firstOutputSegment;
     while (outputSegment) {
+        if (combine) {
+            const float frontTransmittance = luminance(totalTransmittance);
+            for (int chan = 0; chan < deepBuffer.mNumChannels; chan++) {
+                outputSegment->mChannels[chan] = frontTransmittance > 0.f ?
+                    outputSegment->mChannels[chan] / frontTransmittance : 0.f;
+            }
+        }
 
         // For each outputSegment, find all the VolumeSamples that overlap it.
         // If the VolumeSample's t value is greater than the tBack of the last
@@ -1404,7 +1602,7 @@ DeepBuffer::writeHardSurfaceSegmentsNoMask(int idx,
                     // Copy in the channel data, normalizing it by dividing by mTotalWeight
                     // (which is actually the number of samples, so we're just taking the average
                     // value) and premultiply the alpha.
-                    dp[channelIdxs[i]] = isMinMaxChannel(chan) ? minMaxChannel(hs, chan) :
+                    dp[channelIdxs[i]] = isMinMaxChannel(chan) ? minMaxChannel(hs, chan) * alpha :
                                          getChannel(hs, chan) / hs->mTotalWeight * alpha;
                     i++;
                 }
