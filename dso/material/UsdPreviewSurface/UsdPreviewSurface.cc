@@ -141,7 +141,13 @@ UsdPreviewSurface::presence(const scene_rdl2::rdl2::Material* self,
     const UsdPreviewSurface* me = static_cast<const UsdPreviewSurface*>(self);
     const float opacityThreshold = evalFloat(me, attrOpacityThreshold, tls, state);
     const float opacity = evalFloat(me, attrOpacity, tls, state);
-    return opacity >= opacityThreshold ? 1.0f : 0.0f;
+    if (opacityThreshold > 0.0f) {
+        return opacity >= opacityThreshold ? 1.0f : 0.0f;
+    }
+    if (me->get(attrOpacityMode) == ispc::OPACITY_MODE_PRESENCE) {
+        return scene_rdl2::math::saturate(opacity);
+    }
+    return 1.0f;
 }
 
 void
@@ -175,7 +181,10 @@ UsdPreviewSurface::shade(const scene_rdl2::rdl2::Material* self,
     const float ior = evalFloat(me, attrIor, tls, state);
     const float roughness = scene_rdl2::math::saturate(evalFloat(me, attrRoughness, tls, state));
     const float opacityThreshold = scene_rdl2::math::saturate(evalFloat(me, attrOpacityThreshold, tls, state));
-    const float opacity = opacityThreshold > 0.0f ? 1.0f : scene_rdl2::math::saturate(evalFloat(me, attrOpacity, tls, state));
+    // Presence and a cutout are the presence function's; only transparent opacity transmits.
+    const bool transmits = opacityThreshold <= 0.0f &&
+                           me->get(attrOpacityMode) == ispc::OPACITY_MODE_TRANSPARENT;
+    const float opacity = transmits ? scene_rdl2::math::saturate(evalFloat(me, attrOpacity, tls, state)) : 1.0f;
 
     // Emission
     const scene_rdl2::math::Color emissiveColor = evalColor(me, attrEmissiveColor, tls, state);

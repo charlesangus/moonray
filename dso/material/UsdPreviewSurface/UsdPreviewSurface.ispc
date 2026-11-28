@@ -112,6 +112,12 @@ enum SpecularWorkflow {
 
 ISPC_UTIL_EXPORT_ENUM_TO_HEADER(SpecularWorkflow);
 
+enum OpacityMode {
+    OPACITY_MODE_TRANSPARENT,
+    OPACITY_MODE_PRESENCE
+};
+ISPC_UTIL_EXPORT_ENUM_TO_HEADER(OpacityMode);
+
 struct UsdPreviewSurface
 {
     const uniform NormalMap * uniform mNormalMap;
@@ -149,7 +155,9 @@ shade(const uniform Material * uniform  me,
     const float ior = evalAttrIor(me, tls, state);
     const float roughness = saturate(evalAttrRoughness(me, tls, state));
     const float opacityThreshold = saturate(evalAttrOpacityThreshold(me, tls, state));
-    const float opacity = opacityThreshold > 0.0f ? 1.0f : saturate(evalAttrOpacity(me, tls, state));
+    // Presence and a cutout are the presence function's; only transparent opacity transmits.
+    const uniform bool transparentMode = (OpacityMode)getAttrOpacityMode(me) == OPACITY_MODE_TRANSPARENT;
+    const float opacity = (opacityThreshold <= 0.0f && transparentMode) ? saturate(evalAttrOpacity(me, tls, state)) : 1.0f;
 
     // Emission
     const Color emissiveColor = evalAttrEmissiveColor(me, tls, state);

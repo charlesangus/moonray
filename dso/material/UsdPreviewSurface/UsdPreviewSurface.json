@@ -71,6 +71,17 @@
             "default": "1.0f",
             "flags": "FLAGS_BINDABLE"
         },
+        "attrOpacityMode" : {
+            "name": "opacityMode",
+            "comment": "How opacity below 1 is interpreted. With transparent, opacity reduces the diffuse response in favor of transmission through a dielectric of the given ior, while the specular response and emission keep their full weight, as glass does. With presence, opacity scales the whole response, specular and emission included, as if the geometry were partly absent. Ignored when opacityThreshold is above 0.",
+            "type": "Int",
+            "flags": "FLAGS_ENUMERABLE",
+            "enum": {
+                "transparent": "0",
+                "presence": "1"
+            },
+            "default": "0"
+        },
         "attrOpacityThreshold" : {
             "name": "opacityThreshold",
             "comment": "The opacityThreshold input is useful for creating geometric cut-outs based on the opacity input. A value of 0.0 indicates that no masking is applied to the opacity input, while a value greater than 0.0 indicates that rendering of the surface is limited to the areas where the opacity is greater or equal to that value.",
